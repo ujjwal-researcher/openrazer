@@ -2280,8 +2280,9 @@ static int razer_event(struct hid_device *hdev, struct hid_field *field, struct 
     return 0;
 }
 
+
 /**
- * Raw event function
+ * Standard raw event function
  *
  * Bastard function. Could most probably be done a load better.
  * Basically it shifts all of the key's in the 04... event to the right 1, and then sets the first 2 bytes to 0x0100. This then allows the keys to be processed with the above normal event function
@@ -2307,18 +2308,8 @@ static int razer_event(struct hid_device *hdev, struct hid_field *field, struct 
  *
  * HID Usage Table http://www.freebsddiary.org/APC/usb_hid_usages.php
  */
-
-static int razer_raw_event(struct hid_device *hdev, struct hid_report *report, u8 *data, int size)
+static int razer_raw_event_standard(struct hid_device *hdev, struct razer_kbd_device *asc, struct usb_interface *intf, struct hid_report *report, u8 *data, int size)
 {
-    struct usb_interface *intf = to_usb_interface(hdev->dev.parent);
-    struct razer_kbd_device *asc = hid_get_drvdata(hdev);
-    struct usb_device *usb_dev = interface_to_usbdev(intf);
-
-    // No translations needed on the Pro...
-    if (is_blade_laptop(usb_dev)) {
-        return 0;
-    }
-
     // The event were looking for is 16 or 22 bytes long and starts with 0x04.
     // Newer firmware seems to use 22 bytes.
     if(intf->cur_altsetting->desc.bInterfaceProtocol == USB_INTERFACE_PROTOCOL_KEYBOARD &&
@@ -2389,6 +2380,169 @@ static int razer_raw_event(struct hid_device *hdev, struct hid_report *report, u
     }
 
     return 0;
+}
+
+/**
+ * Bitfield raw event function
+ *
+ * Handles raw events very similarly to razer_raw_event_standard, but for size 22, handles the data as a bit field,
+ * instead of an array of values.
+ *
+ * When the rewritten value does not fit the bit field, a key-down and a key-up event is reported separately.
+ */
+static int razer_raw_event_bitfield(struct hid_device *hdev, struct razer_kbd_device *asc, struct usb_interface *intf, struct hid_report *report, u8 *data, int size)
+{
+    u8 bitfield[20] = { 0 };
+
+    // The event were looking for is 16 or 22 bytes long and starts with 0x04.
+    // Newer firmware seems to use 22 bytes.
+    if(intf->cur_altsetting->desc.bInterfaceProtocol == USB_INTERFACE_PROTOCOL_KEYBOARD &&
+       ((size == 22) || (size == 16)) && data[0] == 0x04) {
+        // Convert 04... to 0100...
+        int index = size-1; // This way we start at 2nd last value, does subtract 1 from the 15key rollover though (not an issue cmon)
+        u8 cur_value = 0x00;
+        int found_fn = 0x00;
+
+        while(--index > 0) {
+            bool write_bitfield = true;
+            cur_value = data[index];
+            if(cur_value == 0x00) { // Skip 0x00
+                continue;
+            }
+
+            switch(cur_value) {
+            case 0x01: // FN
+                //cur_value = 0x73; // F24
+                cur_value = 0x00;
+                found_fn = 0x01;
+                write_bitfield = false;
+                break;
+            case 0x20: // M1
+                cur_value = USB_HID_KEY_F13; // F13
+                break;
+            case 0x21: // M2
+                cur_value = USB_HID_KEY_F14; // F14
+                break;
+            case 0x22: // M3
+                cur_value = USB_HID_KEY_F15; // F15
+                break;
+            case 0x23: // M4
+                cur_value = USB_HID_KEY_F16; // F16
+                break;
+            case 0x24: // M5
+                cur_value = USB_HID_KEY_F17; // F17
+                break;
+            case 0x50: // Volume Down
+                cur_value = USB_HID_KEY_MEDIA_VOLUMEDOWN;
+                break;
+            case 0x51: // Volume Up
+                cur_value =  USB_HID_KEY_MEDIA_VOLUMEUP;
+                break;
+            case 0x52: // Mute
+                cur_value = USB_HID_KEY_MEDIA_MUTE;
+                break;
+            case 0x53: // Next (song)
+                cur_value = USB_HID_KEY_MEDIA_NEXTSONG;
+                break;
+            case 0x55: // Play/Pause
+                cur_value = USB_HID_KEY_MEDIA_PLAYPAUSE;
+                break;
+            case 0x54: // Prev (song)
+                cur_value = USB_HID_KEY_MEDIA_PREVIOUSSONG;
+                break;
+            default:
+                write_bitfield = false;
+            }
+
+            // data of size 22 starting with 0x01 is a bit field so we need to handle that separately
+            if (size == 22) {
+                if (write_bitfield) {
+                    if (cur_value < (sizeof(bitfield) * BITS_PER_BYTE)) {
+                        // value fits the bit field, so we can use that
+                        set_bit(cur_value, (unsigned long*) bitfield);
+                    } else {
+                        // value does not fit the bit field, so we need extra handling
+                        int report_extra = 1;
+
+                        switch (cur_value) {
+                        case USB_HID_KEY_MEDIA_VOLUMEUP:
+                            cur_value = USB_HID_USAGE_MEDIA_VOLUMEUP;
+                            break;
+                        case USB_HID_KEY_MEDIA_VOLUMEDOWN:
+                            cur_value = USB_HID_USAGE_MEDIA_VOLUMEDOWN;
+                            break;
+                        case USB_HID_KEY_MEDIA_MUTE:
+                            cur_value = USB_HID_USAGE_MEDIA_MUTE;
+                            break;
+                        case USB_HID_KEY_MEDIA_NEXTSONG:
+                            cur_value = USB_HID_USAGE_MEDIA_NEXTSONG;
+                            break;
+                        case USB_HID_KEY_MEDIA_PLAYPAUSE:
+                            cur_value = USB_HID_USAGE_MEDIA_PLAYPAUSE;
+                            break;
+                        case USB_HID_KEY_MEDIA_PREVIOUSSONG:
+                            cur_value = USB_HID_USAGE_MEDIA_PREVIOUSSONG;
+                            break;
+                        default:
+                            report_extra = 0;
+                        }
+
+                        if (report_extra) {
+                            u8 xdata[22] = { 0x02 };
+
+                            // report key down
+                            xdata[1] = cur_value;
+                            hid_report_raw_event(hdev, HID_INPUT_REPORT, xdata, sizeof(xdata), 0);
+
+                            // report key up
+                            xdata[1] = 0x00;
+                            hid_report_raw_event(hdev, HID_INPUT_REPORT, xdata, sizeof(xdata), 0);
+                        }
+                    }
+                }
+            } else { // size 16
+                data[index+1] = cur_value;
+            }
+        }
+
+        asc->fn_on = !!found_fn;
+
+        data[0] = 0x01;
+        data[1] = 0x00;
+        if (size == 22) {
+            memcpy(data + 2, bitfield, sizeof(bitfield));
+        }
+
+        // Some reason just by editing data, it generates a normal event above. (Could quite possibly work like that, no clue)
+        //hid_report_raw_event(hdev, HID_INPUT_REPORT, data, size, 0);
+        return 1;
+    }
+
+    return 0;
+}
+
+/**
+ * Raw event function
+ *
+ * Handles provided HID reports, branched out for specific keyboard models, since some keyboards need specific handling.
+ */
+static int razer_raw_event(struct hid_device *hdev, struct hid_report *report, u8 *data, int size)
+{
+    struct usb_interface *intf = to_usb_interface(hdev->dev.parent);
+    struct razer_kbd_device *asc = hid_get_drvdata(hdev);
+    struct usb_device *usb_dev = interface_to_usbdev(intf);
+
+    // No translations needed on the Pro...
+    if (is_blade_laptop(usb_dev)) {
+        return 0;
+    }
+
+    switch (usb_dev->descriptor.idProduct) {
+    case USB_DEVICE_ID_RAZER_BLACKWIDOW_V3:
+        return razer_raw_event_bitfield(hdev, asc, intf, report, data, size);
+    default:
+        return razer_raw_event_standard(hdev, asc, intf, report, data, size);
+    }
 }
 
 /**
